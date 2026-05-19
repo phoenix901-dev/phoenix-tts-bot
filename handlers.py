@@ -11,7 +11,7 @@ import edge_tts
 
 from database import get_user, update_user
 from keyboards import main_menu, settings_menu, voices_menu, rates_menu
-from core import parse_file, process_book
+from core import parse_file, process_book, clean_text, get_semaphore
 
 router = Router()
 TEMP_BASE = Path("/root/telegram/bbot/tmp")
@@ -109,11 +109,13 @@ async def process_short_text(message: Message):
     tmp_ogg = TEMP_BASE / f"msg_{message.message_id}.ogg"
     
     try:
-        communicate = edge_tts.Communicate(message.text, user.text_voice, rate=user.rate)
-        await communicate.save(str(tmp_mp3))
+        async with get_semaphore():
+            cleaned_text = clean_text(message.text)
+            communicate = edge_tts.Communicate(cleaned_text, user.text_voice, rate=user.rate)
+            await communicate.save(str(tmp_mp3))
         
-        cmd = f"ffmpeg -i '{tmp_mp3}' -c:a libopus -b:a 32k '{tmp_ogg}' -y"
-        proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        cmd = ["ffmpeg", "-i", str(tmp_mp3), "-c:a", "libopus", "-b:a", "32k", str(tmp_ogg), "-y"]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await proc.communicate()
         
         try:
@@ -170,8 +172,10 @@ async def process_document(message: Message, bot: Bot):
                 last_percent = percent
             except: pass 
 
+    clean_filename = os.path.splitext(message.document.file_name)[0]
+
     # ТУТ ВАЖНОЕ ИЗМЕНЕНИЕ: мы получаем список томов
-    volumes = await process_book(raw_text, workdir, user.book_voice, user.rate, progress)
+    volumes = await process_book(raw_text, workdir, user.book_voice, user.rate, progress, clean_filename)
     
     if not volumes:
         await status_msg.edit_text("❌ Ошибка при нарезке текста.")
@@ -180,8 +184,6 @@ async def process_document(message: Message, bot: Bot):
 
     total_volumes = len(volumes)
     await status_msg.edit_text(f"📦 Собираю аудиокнигу. Получилось частей: {total_volumes}. Отправляю...")
-    
-    clean_filename = os.path.splitext(message.document.file_name)[0]
     
     try:
         # ТУТ ВАЖНОЕ ИЗМЕНЕНИЕ: цикл для отправки каждого тома отдельно
