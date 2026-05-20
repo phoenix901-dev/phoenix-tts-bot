@@ -156,6 +156,11 @@ async def process_document(message: Message, bot: Bot):
     await status_msg.edit_text("📖 Читаю файл и подготавливаю текст...")
     raw_text = await parse_file(input_path, ext)
     
+    if raw_text is None:
+        await status_msg.edit_text("❌ Ошибка: превышено время ожидания при обработке файла (таймаут 60 секунд). Возможно, файл слишком сложный или содержит много медиаданных.")
+        shutil.rmtree(workdir)
+        return
+
     if not raw_text:
         await status_msg.edit_text("❌ Не удалось извлечь текст. Возможно, файл пуст или это картинка в PDF без текстового слоя.")
         shutil.rmtree(workdir)

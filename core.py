@@ -30,20 +30,30 @@ def clean_text(text: str) -> str:
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-async def parse_file(input_path: Path, ext: str) -> str:
+async def parse_file(input_path: Path, ext: str) -> str | None:
     """Извлечение текста с сохранением семантической структуры (Markdown)."""
     md_path = input_path.with_suffix('.md')
     
     if ext == 'pdf':
-        cmd = ["pdftotext", str(input_path), str(md_path)]
+        cmd = ["pdftotext", "-q", str(input_path), str(md_path)]
     elif ext in ['doc', 'docx', 'fb2', 'epub', 'mobi']:
         # Конвертация в markdown сохраняет структуру глав (# Заголовок)
-        cmd = ["pandoc", "-t", "markdown", str(input_path), "-o", str(md_path)]
+        # Добавляем --quiet для подавления вывода
+        cmd = ["pandoc", "--quiet", "-t", "markdown", str(input_path), "-o", str(md_path)]
     else: # txt
         return input_path.read_text(encoding='utf-8', errors='ignore')
         
     proc = await asyncio.create_subprocess_exec(*cmd)
-    await proc.communicate()
+
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=60.0)
+    except (asyncio.TimeoutError, TimeoutError):
+        try:
+            proc.kill()
+            await proc.communicate()
+        except Exception:
+            pass
+        return None
     
     if md_path.exists():
         return md_path.read_text(encoding='utf-8', errors='ignore')
