@@ -1,0 +1,20 @@
+# Локальная БД
+*.db
+*.db-wal
+*.db-shm
+
+# Временные файлы синтеза
+tmp/
+*.mp3
+*.ogg
+list.txt
+
+# Окружение
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Секреты
+.env

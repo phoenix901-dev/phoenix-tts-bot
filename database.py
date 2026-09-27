@@ -1,4 +1,5 @@
 import asyncio
+import os
 from sqlalchemy import Column, Integer, String, BigInteger, select, update
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
@@ -13,12 +14,19 @@ class User(Base):
     book_voice = Column(String, default='ru-RU-DmitryNeural')
     rate = Column(String, default='+15%')
 
+DB_PATH = os.getenv("TTS_DB_PATH", "tts_bot.db")
+
 # Отключаем echo, чтобы не мусорить в системном журнале
-engine = create_async_engine("sqlite+aiosqlite:///prometheus.db", echo=False)
+engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}", echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def init_db():
     async with engine.begin() as conn:
+        # WAL нужен, потому что get_user и update_user идут параллельно
+        # из разных хендлеров: на дефолтном journal-режиме SQLite ловил
+        # "database is locked".
+        await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+        await conn.exec_driver_sql("PRAGMA busy_timeout=30000")
         await conn.run_sync(Base.metadata.create_all)
 
 async def get_user(tg_id: int):
