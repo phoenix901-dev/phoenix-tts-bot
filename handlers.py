@@ -12,10 +12,15 @@ from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 import edge_tts
 
 from database import get_user, update_user
-from keyboards import main_menu, settings_menu, voices_menu, rates_menu
+from keyboards import main_menu, settings_menu, voices_menu, rates_menu, VOICES, RATES
 from core import parse_file, process_book, clean_text, get_semaphore, SUPPORTED_EXTS
 
 logger = logging.getLogger(__name__)
+
+# Валидация пришедших callback-данных: кнопка из старого сообщения могла
+# содержать голос/скорость, которых уже нет в меню.
+_VALID_VOICES = {code for _, code in VOICES}
+_VALID_RATES = {code for _, code in RATES}
 
 router = Router()
 TEMP_BASE = Path(os.getenv("TTS_TMP_DIR", "/root/telegram/bbot/tmp"))
@@ -39,9 +44,21 @@ def safe_filename(name: str | None, fallback: str = "file") -> str:
     """
     name = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
     name = _UNSAFE_NAME_RE.sub("_", name).strip().replace(" ", "_")
-    return name[:120] or fallback
+    # Дополнительная проверка: ".." или "." состояли бы из одних точек,
+    # не попали бы под фильтр символов и увели запись на уровень выше.
+    if not name or set(name) <= {"."}:
+        return fallback
+    return name[:120]
 
 def _user_lock(user_id: int) -> asyncio.Lock:
+    # Словарь иначе рос бы бесконечно: по объекту на каждого, кто когда-либо
+    # прислал книгу. Чистим только незанятые локи, чтобы не сломать
+    # сериализацию тех, кто прямо сейчас в очереди.
+    if len(_user_book_locks) > 1024:
+        for uid, lk in list(_user_book_locks.items()):
+            if not lk.locked():
+                _user_book_locks.pop(uid, None)
+
     lock = _user_book_locks.get(user_id)
     if lock is None:
         lock = asyncio.Lock()
@@ -70,11 +87,19 @@ async def _probe_duration(path: Path) -> int:
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await proc.communicate()
+        # Без таймаута битый файл подвешивал бы обработку навсегда.
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
         return max(1, int(float(out.decode().strip())))
-    except (ValueError, OSError):
+    except (ValueError, OSError, asyncio.TimeoutError):
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.communicate()  # переиспользуем процесс, не плодим зомби
+            except Exception:
+                pass
         return 1
 
 
@@ -106,11 +131,12 @@ async def settings_cmd(message: Message):
 
 @router.callback_query(F.data.startswith("set_voice_"))
 async def voice_select(call: CallbackQuery):
-    await call.answer()
     mode = call.data.rsplit("_", 1)[-1]
     if mode not in {"text", "book"}:
+        # answer() можно вызвать только один раз, иначе Telegram отклонит запрос.
         await call.answer("Неизвестный режим", show_alert=True)
         return
+    await call.answer()
     mode_ru = "ТЕКСТА" if mode == "text" else "КНИГ"
     await _safe_edit(
         call,
@@ -120,8 +146,11 @@ async def voice_select(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("voice_"))
 async def voice_apply(call: CallbackQuery):
-    await call.answer()
     _, mode, voice_code = call.data.split("_", 2)
+    if voice_code not in _VALID_VOICES or mode not in {"text", "book"}:
+        await call.answer("Этот голос больше недоступен, открой настройки заново.", show_alert=True)
+        return
+    await call.answer()
     if mode == "text":
         await update_user(call.from_user.id, text_voice=voice_code)
     else:
@@ -145,8 +174,11 @@ async def rate_select(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("rate_"))
 async def rate_apply(call: CallbackQuery):
-    await call.answer()
     rate_code = call.data.split("_", 1)[1]
+    if rate_code not in _VALID_RATES:
+        await call.answer("Эта скорость больше недоступна, открой настройки заново.", show_alert=True)
+        return
+    await call.answer()
     await update_user(call.from_user.id, rate=rate_code)
 
     await _safe_edit(
@@ -188,6 +220,11 @@ async def process_short_text(message: Message):
     try:
         async with get_semaphore():
             cleaned_text = clean_text(message.text)
+            # Если после чистки не осталось букв (одни эмодзи/ссылки/разметка),
+            # edge-tts либо падает, либо отдаёт битый файл.
+            if not re.search(r"\w", cleaned_text, flags=re.UNICODE):
+                raise ValueError("в сообщении нет текста для озвучки")
+
             communicate = edge_tts.Communicate(cleaned_text, user.text_voice, rate=user.rate)
             await communicate.save(str(tmp_mp3))
 
@@ -233,7 +270,7 @@ async def process_document(message: Message, bot: Bot):
         await message.answer("📦 Файл слишком большой — Telegram не даёт скачать больше 20 МБ. Разбей книгу на части и пришли по очереди.")
         return
 
-    # Не даём одному пользовачеку занять всю очередь десятком томов.
+    # Не даём одному пользователю занять всю очередь десятком томов.
     lock = _user_lock(message.from_user.id)
     if lock.locked():
         await message.answer("⏳ Ты уже ждёшь одну книгу. Дождись её, а потом присылай следующую.")

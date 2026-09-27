@@ -1,4 +1,3 @@
-import os
 import asyncio
 import shutil
 import re
@@ -56,34 +55,80 @@ def clean_text(text: str) -> str:
     text = _INLINE_WS_RE.sub(" ", text)
     return text.strip()
 
+# Таймаут на извлечение текста: FB2/PDF с большим количеством медиа
+# подвешивали pandoc/pdftotext навсегда.
+PARSE_TIMEOUT = 60.0
+
 async def parse_file(input_path: Path, ext: str) -> str | None:
-    """Извлечение текста с сохранением семантической структуры (Markdown)."""
+    """Извлечение текста с сохранением семантической структуры (Markdown).
+
+    Возвращает None при таймауте, "" — если текст извлечь не удалось.
+    """
     md_path = input_path.with_suffix('.md')
-    
+
+    if ext == 'txt':
+        try:
+            return input_path.read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            return ""
+
     if ext == 'pdf':
         cmd = ["pdftotext", "-q", str(input_path), str(md_path)]
     elif ext in ['doc', 'docx', 'fb2', 'epub', 'mobi']:
         # Конвертация в markdown сохраняет структуру глав (# Заголовок)
         # Добавляем --quiet для подавления вывода
         cmd = ["pandoc", "--quiet", "-t", "markdown", str(input_path), "-o", str(md_path)]
-    else: # txt
-        return input_path.read_text(encoding='utf-8', errors='ignore')
-        
-    proc = await asyncio.create_subprocess_exec(*cmd)
+    else:
+        return ""
 
     try:
-        await asyncio.wait_for(proc.communicate(), timeout=60.0)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, OSError):
+        # pandoc/pdftotext не установлены на сервере.
+        return ""
+
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=PARSE_TIMEOUT)
     except (asyncio.TimeoutError, TimeoutError):
         try:
             proc.kill()
             await proc.communicate()
         except Exception:
             pass
+        md_path.unlink(missing_ok=True)
         return None
-    
+
+    # Проверяем код возврата: при ошибке pandoc/pdftotext оставлял частично
+    # записанный файл, и этот мусор уходил в озвучку.
+    if proc.returncode != 0:
+        md_path.unlink(missing_ok=True)
+        return ""
+
     if md_path.exists():
-        return md_path.read_text(encoding='utf-8', errors='ignore')
+        try:
+            return md_path.read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            return ""
     return ""
+
+async def validate_voices(codes) -> list[str]:
+    """Проверяет коды голосов против живого списка edge-tts.
+
+    Возвращает список несуществующих кодов. Если список получить не удалось
+    (нет сети), возвращает пустой список — не мешаем запуску.
+    """
+    try:
+        voices = await edge_tts.list_voices()
+    except Exception:
+        return []
+
+    known = {v.get("ShortName") for v in voices}
+    return sorted(code for code in set(codes) if code not in known)
+
 
 async def generate_chunk(text: str, path: Path, voice: str, rate: str):
     """Озвучивает один чанк с повторами при сетевых сбоях."""
@@ -149,8 +194,9 @@ def split_chunks(text: str, limit: int = TTS_CHUNK_SIZE) -> list[str]:
                 if head:
                     chunks.append(head)
                 sent = tail
+            # continue, а не break: иначе терялись все оставшиеся фразы абзаца.
             if not sent:
-                break
+                continue
             if not buf:
                 buf = sent
             elif len(buf) + 1 + len(sent) <= limit:
@@ -183,9 +229,12 @@ async def _squeeze_to_telegram_limit(final_file: Path) -> Path:
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
     await proc.communicate()
 
-    if small_file.exists() and small_file.stat().st_size > 0:
+    # Без проверки returncode можно подменить рабочий том битым огрызком.
+    if proc.returncode == 0 and small_file.exists() and small_file.stat().st_size > 0:
         final_file.unlink(missing_ok=True)
         small_file.replace(final_file)
+    else:
+        small_file.unlink(missing_ok=True)
     return final_file
 
 async def process_book(text: str, workdir: Path, voice: str, rate: str, progress_callback, filename: str = "Unknown"):
