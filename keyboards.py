@@ -6,13 +6,11 @@ VOICES: list[tuple[str, str]] = [
     # Русский
     ("RU · Дмитрий (М)", "ru-RU-DmitryNeural"),
     ("RU · Светлана (Ж)", "ru-RU-SvetlanaNeural"),
-    ("RU · Дарья (Ж)", "ru-RU-DariyaNeural"),
     # Украинский
     ("UA · Остап (М)", "uk-UA-OstapNeural"),
     ("UA · Полина (Ж)", "uk-UA-PolinaNeural"),
     # Английский (US)
     ("EN · Guy (М)", "en-US-GuyNeural"),
-    ("EN · Davis (М)", "en-US-DavisNeural"),
     ("EN · Aria (Ж)", "en-US-AriaNeural"),
     ("EN · Jenny (Ж)", "en-US-JennyNeural"),
     # Английский (UK)
