@@ -8,12 +8,13 @@ from pathlib import Path
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramRetryAfter
 
 from database import get_user, update_user
 from keyboards import main_menu, settings_menu, voices_menu, rates_menu, voice_label, VOICES, RATES
 from core import parse_file, process_book, clean_text, get_semaphore, SUPPORTED_EXTS
 from engines import SILERO, atempo_args, engine_of, part_suffix, synthesize
+from publish import ATTACH_SINGLE_PART, BOOK_TTL_DAYS, publish
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,10 @@ TEMP_BASE.mkdir(parents=True, exist_ok=True)
 
 # Telegram не даёт скачивать файлы больше 20 МБ через getFile.
 MAX_FILE_BYTES = 20 * 1024 * 1024
+
+# Бот не может отправить вложение больше 50 МБ, поэтому вкладываем только то,
+# что заведомо проходит; всё остальное уходит ссылкой (см. publish.py).
+MAX_ATTACH_BYTES = 45 * 1024 * 1024
 
 # Одна книга на пользователя: иначе можно было забить очередь десятком томов.
 _user_book_locks: dict[int, asyncio.Lock] = {}
@@ -268,6 +273,42 @@ async def process_short_text(message: Message):
         tmp_speech.unlink(missing_ok=True)
         tmp_ogg.unlink(missing_ok=True)
 
+async def _send_volumes_as_files(message: Message, volumes: list, base_name: str) -> None:
+    """Запасной путь: отдать тома прямо в Телеграм.
+
+    Ловим TelegramRetryAfter: при отправке нескольких больших файлов подряд
+    Телеграм включает флуд-лимит, и раньше книга после этого приходила
+    частично — цикл обрывался на первом же отказе.
+    """
+    total = len(volumes)
+    for idx, volume in enumerate(volumes, 1):
+        caption = (
+            f"✨ Твоя аудиокнига готова! (Часть {idx} из {total})" if idx == 1
+            else f"Часть {idx} из {total}"
+        )
+        for attempt in range(5):
+            try:
+                await message.answer_audio(
+                    FSInputFile(volume, filename=f"{base_name}_Часть_{idx}.mp3"),
+                    caption=caption,
+                )
+                break
+            except TelegramRetryAfter as exc:
+                logger.warning(
+                    "Телеграм просит подождать %s с (часть %s из %s)", exc.retry_after, idx, total
+                )
+                await asyncio.sleep(exc.retry_after + 1)
+            except TelegramAPIError as exc:
+                logger.exception("Часть %s не отправилась", idx)
+                await message.answer(f"❌ Не отправилась часть {idx} из {total}: {exc}")
+                return
+        else:
+            await message.answer(f"❌ Телеграм так и не принял часть {idx} из {total}.")
+            return
+        # Пауза между файлами: снижает шанс поймать флуд-лимит.
+        await asyncio.sleep(2)
+
+
 @router.message(F.document)
 async def process_document(message: Message, bot: Bot):
     user = await get_user(message.from_user.id)
@@ -338,22 +379,40 @@ async def process_document(message: Message, bot: Bot):
                 return
 
             total_volumes = len(volumes)
-            await status_msg.edit_text(f"📦 Собираю аудиокнигу. Получилось частей: {total_volumes}. Отправляю...")
+            total_mb = sum(v.stat().st_size for v in volumes) / 1048576
+            await status_msg.edit_text(
+                f"📦 Собираю аудиокнигу: частей {total_volumes}, {total_mb:.0f} МБ. Готовлю ссылку..."
+            )
 
+            # Основной путь: книга уходит ссылкой на наш сервер. Телеграм не
+            # пускает файлы больше 50 МБ, а книга целиком бывает и на 300 МБ.
+            book_url, parts = "", []
             try:
-                # ТУТ ВАЖНОЕ ИЗМЕНЕНИЕ: цикл для отправки каждого тома отдельно
-                for i, vol_path in enumerate(volumes, 1):
-                    caption = f"✨ Твоя аудиокнига готова! (Часть {i} из {total_volumes})" if i == 1 else f"Часть {i} из {total_volumes}"
+                book_url, _book_dir, parts = await asyncio.to_thread(publish, volumes, clean_filename)
+            except Exception:
+                logger.exception("Не удалось опубликовать книгу, отдаю файлами в Телеграм")
 
-                    await message.answer_audio(
-                        FSInputFile(vol_path, filename=f"{clean_filename}_Часть_{i}.mp3"),
-                        caption=caption
-                    )
-                    # Защита от флуда
-                    await asyncio.sleep(2)
+            if not book_url:
+                # Запасной путь: если публикация упала, отдаём хотя бы вложениями.
+                await _send_volumes_as_files(message, volumes, clean_filename)
+                return
 
-            except Exception as e:
-                await message.answer(f"❌ Произошла ошибка сети при отправке: {str(e)}")
+            caption = (
+                f"📚 Аудиокнига готова\n\n"
+                f"{clean_filename}\n"
+                f"Частей: {total_volumes}, всего {total_mb:.0f} МБ\n\n"
+                f"Скачать: {book_url}\n"
+                f"Ссылка живёт {BOOK_TTL_DAYS} дней."
+            )
+
+            # Книгу из одной части можно и вложением прислать: лимит Телеграма
+            # она не рвёт, а слушать её в плеере удобнее.
+            if ATTACH_SINGLE_PART and len(parts) == 1 and parts[0].stat().st_size <= MAX_ATTACH_BYTES:
+                await message.answer_audio(
+                    FSInputFile(parts[0], filename=parts[0].name), caption=caption
+                )
+            else:
+                await message.answer(caption)
 
         except Exception as e:
             # Раньше process_book стоял ВНЕ try, поэтому любой сбой рендера

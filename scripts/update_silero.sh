@@ -54,10 +54,10 @@ else
     log "ПРЕДУПРЕЖДЕНИЕ: список моделей не скачался, работаю с локальным"
 fi
 
-# Новейшая русская модель из списка (v5_6_ru новее v5_ru) и её файл.
-mapfile -t ru_models < <(grep -E '^ {2,6}v[0-9]+(_[0-9]+)?_ru:' "$MODELS_YML" 2>/dev/null \
-    | sed -E 's/^[[:space:]]*([^:]+):.*/\1/' | sort -V)
-newest_model="${ru_models[-1]:-v5_ru}"
+# Новейшая русская модель: имя спрашиваем у самого движка, чтобы правило
+# выбора версии жило в одном месте (engines.resolve_model_id).
+newest_model=$(cd "$BOT_DIR" && "$PY" -c "import engines; print(engines.resolve_model_id())" 2>/dev/null)
+newest_model="${newest_model:-v5_ru}"
 model_url=$(grep -A3 -E "^ {2,6}${newest_model}:" "$MODELS_YML" 2>/dev/null \
     | sed -n "s/.*package: *'\([^']*\)'.*/\1/p" | head -1)
 model_file="$MODEL_DIR/$(basename "${model_url:-$newest_model.pt}")"
@@ -113,5 +113,7 @@ if [[ $? -ne 0 ]]; then
 fi
 
 systemctl restart "$SERVICE" >>"$LOG" 2>&1
+# Старые модели на диске больше не нужны: движок грузит только актуальную.
+find "$MODEL_DIR" -maxdepth 1 -name '*.pt' ! -name "$(basename "$model_file")" -delete 2>/dev/null
 log "OK: silero $new_ver, модель $newest_model. Тест синтеза: $(echo "$smoke" | tail -1)"
 exit 0

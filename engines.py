@@ -121,7 +121,8 @@ def resolve_model_id() -> str:
     for name in re.findall(r"^\s{2,6}(v\d+(?:_\d+)?_ru):", text, flags=re.M):
         m = re.match(r"v(\d+)(?:_(\d+))?_ru", name)
         if m:
-            found.append(((int(m.group(1)), int(m.group(2) or 1)), name))
+            # v5_ru — это v5.0, v5_6_ru — v5.6, поэтому младший номер 0.
+            found.append(((int(m.group(1)), int(m.group(2) or 0)), name))
     return max(found)[1] if found else SILERO_FALLBACK_MODEL
 
 

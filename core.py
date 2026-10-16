@@ -21,6 +21,9 @@ from engines import (
 # поэтому 200 000 символов давали ~80 МБ на том и ЛЮБАЯ большая книга падала
 # на отправке с "file is too big". 75 000 символов ~= 88 минут ~= 32 МБ.
 MAX_VOL_CHARS = 75000
+# Часть короче этого порога отдельным файлом не отдаём: это не глава, а
+# осиротевший заголовок или обрывок — приклеиваем к соседней части.
+MIN_PART_CHARS = 2000
 # Сверх этого размера том автоматически пережимается перед отправкой.
 MAX_VOL_BYTES = 45 * 1024 * 1024
 # Размер микро-чанка для edge-tts (для Silero он свой, см. engines.chunk_size_for).
@@ -267,7 +270,7 @@ async def process_book(text: str, workdir: Path, voice: str, rate: str, progress
         if len(block) > MAX_VOL_CHARS:
             sub_blocks = split_chunks(block, MAX_VOL_CHARS)
             for sb in sub_blocks:
-                if current_len + len(sb) > MAX_VOL_CHARS and current_len > 0:
+                if current_len + len(sb) > MAX_VOL_CHARS and current_len >= MIN_PART_CHARS:
                     volumes_text.append(" ".join(current_vol))
                     current_vol = [sb]
                     current_len = len(sb)
@@ -276,7 +279,7 @@ async def process_book(text: str, workdir: Path, voice: str, rate: str, progress
                     current_len += len(sb)
         else:
             # Штатная укладка глав в Том
-            if current_len + len(block) > MAX_VOL_CHARS and current_len > 0:
+            if current_len + len(block) > MAX_VOL_CHARS and current_len >= MIN_PART_CHARS:
                 volumes_text.append(" ".join(current_vol))
                 current_vol = [block]
                 current_len = len(block)

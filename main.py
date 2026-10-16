@@ -2,6 +2,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import BotCommand
@@ -11,8 +12,32 @@ from keyboards import VOICES
 from core import validate_voices
 from engines import SILERO_WARMUP, resolve_model_id, warmup
 
-# Токен передаётся через переменную окружения TELEGRAM_BOT_TOKEN,
-# чтобы он не лежал в коде и не попадал в историю git.
+# Секреты и настройки берём из .env рядом с проектом. Реальные переменные
+# окружения (например, EnvironmentFile у systemd) приоритетнее файла, поэтому
+# существующие установки продолжают работать как раньше.
+_ENV_FILE = Path(__file__).with_name(".env")
+
+
+def _load_env_file(path: Path) -> None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(_ENV_FILE)
+
+# Токен лежит в .env рядом с проектом (или в переменной окружения) — в коде
+# и в истории git его нет.
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 # Путь к лог-файлу. Без него логи демона теряются при рестарте.
