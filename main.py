@@ -9,6 +9,7 @@ from database import init_db
 from handlers import router
 from keyboards import VOICES
 from core import validate_voices
+from engines import SILERO_WARMUP, resolve_model_id, warmup
 
 # Токен передаётся через переменную окружения TELEGRAM_BOT_TOKEN,
 # чтобы он не лежал в коде и не попадал в историю git.
@@ -41,6 +42,15 @@ async def main():
     invalid = await validate_voices([code for _, code in VOICES])
     if invalid:
         logger.warning("Нерабочие коды голосов в keyboards.VOICES: %s", ", ".join(invalid))
+
+    # Локальный движок грузит модель в память при первом запросе (пара секунд).
+    # SILERO_WARMUP=1 переносит эту задержку на старт бота.
+    if SILERO_WARMUP:
+        try:
+            await warmup()
+            logger.info("Модель Silero прогрета: %s", resolve_model_id())
+        except Exception as exc:  # noqa: BLE001 - бот должен стартовать в любом случае
+            logger.warning("Silero не прогрелась (%s) — загрузится при первом запросе", exc)
 
     # Расширяем сетевой таймаут до 300 секунд (5 минут) для тяжелых аудиофайлов
     session = AiohttpSession(timeout=300)

@@ -7,7 +7,14 @@
 tmp/
 *.mp3
 *.ogg
+*.wav
 list.txt
+
+# Список моделей Silero — приходит из scripts/update_silero.sh
+silero_models.yml
+silero_check.wav
+# ... его же иногда создаёт сам пакет silero в текущем каталоге
+latest_silero_models.yml
 
 # Окружение
 .venv/

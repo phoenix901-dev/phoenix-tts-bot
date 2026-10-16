@@ -9,11 +9,12 @@ from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
-import edge_tts
 
 from database import get_user, update_user
-from keyboards import main_menu, settings_menu, voices_menu, rates_menu, VOICES, RATES
+from keyboards import main_menu, settings_menu, voices_menu, rates_menu, voice_label, VOICES, RATES
 from core import parse_file, process_book, clean_text, get_semaphore, SUPPORTED_EXTS
+from engines import SILERO, atempo_args, engine_of, part_suffix, synthesize
+
 
 logger = logging.getLogger(__name__)
 
@@ -120,9 +121,9 @@ async def settings_cmd(message: Message):
     user = await get_user(message.from_user.id)
     text = (
         "⚙️ **Твои настройки**\n\n"
-        f"🗣 Голос (Текст): `{user.text_voice}`\n"
-        f"📚 Голос (Книги): `{user.book_voice}`\n"
-        f"⚡ Скорость: `{user.rate}`\n\n"
+        f"🗣 Голос (Текст): {voice_label(user.text_voice)}\n"
+        f"📚 Голос (Книги): {voice_label(user.book_voice)}\n"
+        f"⚡ Скорость: {user.rate}\n\n"
         "Выбери, что хочешь изменить:"
     )
     await message.answer(text, reply_markup=settings_menu())
@@ -159,7 +160,7 @@ async def voice_apply(call: CallbackQuery):
     await _safe_edit(
         call,
         f"✅ Отлично! Новый голос сохранен.\n\n"
-        f"Текущий выбор: `{voice_code}`",
+        f"Текущий выбор: {voice_label(voice_code)}",
         reply_markup=settings_menu()
     )
 
@@ -194,9 +195,9 @@ async def back_to_settings(call: CallbackQuery):
     user = await get_user(call.from_user.id)
     text = (
         "⚙️ **Твои настройки**\n\n"
-        f"🗣 Голос (Текст): `{user.text_voice}`\n"
-        f"📚 Голос (Книги): `{user.book_voice}`\n"
-        f"⚡ Скорость: `{user.rate}`\n\n"
+        f"🗣 Голос (Текст): {voice_label(user.text_voice)}\n"
+        f"📚 Голос (Книги): {voice_label(user.book_voice)}\n"
+        f"⚡ Скорость: {user.rate}\n\n"
         "Выбери, что хочешь изменить:"
     )
     await _safe_edit(call, text, reply_markup=settings_menu())
@@ -214,21 +215,32 @@ async def process_short_text(message: Message):
     # одинаковым message_id раньше писали в один и тот же файл и портили
     # друг другу аудио.
     stem = f"msg_{message.from_user.id}_{message.chat.id}_{message.message_id}"
-    tmp_mp3 = TEMP_BASE / f"{stem}.mp3"
+    # Движок сам выбирает формат: edge отдаёт mp3, Silero — wav.
+    suffix = part_suffix(user.text_voice)
+    tmp_speech = TEMP_BASE / f"{stem}{suffix}"
     tmp_ogg = TEMP_BASE / f"{stem}.ogg"
 
     try:
-        async with get_semaphore():
-            cleaned_text = clean_text(message.text)
-            # Если после чистки не осталось букв (одни эмодзи/ссылки/разметка),
-            # edge-tts либо падает, либо отдаёт битый файл.
-            if not re.search(r"\w", cleaned_text, flags=re.UNICODE):
-                raise ValueError("в сообщении нет текста для озвучки")
+        cleaned_text = clean_text(message.text)
+        # Если после чистки не осталось букв (одни эмодзи/ссылки/разметка),
+        # любой движок либо падает, либо отдаёт битый файл.
+        if not re.search(r"\w", cleaned_text, flags=re.UNICODE):
+            raise ValueError("в сообщении нет текста для озвучки")
 
-            communicate = edge_tts.Communicate(cleaned_text, user.text_voice, rate=user.rate)
-            await communicate.save(str(tmp_mp3))
+        # У edge-tts общая сетевая очередь, Silero считает локально и держит
+        # своё ограничение параллельности (engines.SILERO_WORKERS).
+        if engine_of(user.text_voice) == SILERO:
+            await synthesize(cleaned_text, user.text_voice, user.rate, tmp_speech)
+        else:
+            async with get_semaphore():
+                await synthesize(cleaned_text, user.text_voice, user.rate, tmp_speech)
 
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(tmp_mp3), "-c:a", "libopus", "-b:a", "32k", str(tmp_ogg), "-y"]
+        # Скорость: edge вставляет её сам при синтезе, Silero — только фильтром
+        # на готовом файле, иначе получилось бы двойное ускорение.
+        rate_args = atempo_args(user.rate) if engine_of(user.text_voice) == SILERO else []
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(tmp_speech),
+               *rate_args, "-c:a", "libopus", "-b:a", "32k", str(tmp_ogg), "-y"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await proc.communicate()
 
@@ -242,7 +254,7 @@ async def process_short_text(message: Message):
         except TelegramBadRequest as e:
             if "VOICE_MESSAGES_FORBIDDEN" in str(e):
                 await message.answer_audio(
-                    FSInputFile(tmp_mp3, filename="voice.mp3"),
+                    FSInputFile(tmp_speech, filename=f"voice{suffix}"),
                     caption="🔒 Твои настройки приватности блокируют голосовые сообщения. Отправляю обычным аудиофайлом."
                 )
             else:
@@ -253,7 +265,7 @@ async def process_short_text(message: Message):
         await message.answer(f"❌ Ошибка при обработке: {str(e)}")
     finally:
         await _safe_delete(status_msg)
-        tmp_mp3.unlink(missing_ok=True)
+        tmp_speech.unlink(missing_ok=True)
         tmp_ogg.unlink(missing_ok=True)
 
 @router.message(F.document)

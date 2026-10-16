@@ -1,8 +1,11 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-# Курируемый список голосов edge-tts. Проверяется на старте бота
+from engines import silero_code
+
+# Курируемый список голосов. edge-коды проверяются на старте бота
 # (validate_voices), чтобы опечатка не вылезала юзеру во время озвучки.
-VOICES: list[tuple[str, str]] = [
+# Silero-голоса помечены префиксом silero: — это локальный движок.
+EDGE_VOICES: list[tuple[str, str]] = [
     # Русский
     ("RU · Дмитрий (М)", "ru-RU-DmitryNeural"),
     ("RU · Светлана (Ж)", "ru-RU-SvetlanaNeural"),
@@ -29,6 +32,27 @@ VOICES: list[tuple[str, str]] = [
     ("TR · Ahmet (М)", "tr-TR-AhmetNeural"),
     ("TR · Emel (Ж)", "tr-TR-EmelNeural"),
 ]
+
+# Локальный движок Silero: работает без интернета, голоса только русские.
+# Список голосов берётся из модели (см. scripts/update_silero.sh), здесь —
+# те, что есть во всех актуальных v5-моделях.
+SILERO_VOICES: list[tuple[str, str]] = [
+    ("RU офлайн · Айдар (М)", silero_code("aidar")),
+    ("RU офлайн · Байя (Ж)", silero_code("baya")),
+    ("RU офлайн · Ксения (Ж)", silero_code("kseniya")),
+    ("RU офлайн · Евгений (М)", silero_code("eugene")),
+    ("RU офлайн · Ксения-2 (Ж)", silero_code("xenia")),
+]
+
+VOICES: list[tuple[str, str]] = EDGE_VOICES + SILERO_VOICES
+
+_VOICE_LABELS = {code: name for name, code in VOICES}
+
+
+def voice_label(code: str) -> str:
+    """Человеческое имя голоса для настроек: 'silero:aidar' -> 'RU офлайн · Айдар (М)'."""
+    return _VOICE_LABELS.get(code, code)
+
 
 
 def main_menu():

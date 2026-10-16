@@ -6,7 +6,16 @@ import aiofiles
 from pathlib import Path
 import edge_tts
 
-THREADS = 12
+from engines import (
+    SILERO,
+    atempo_args,
+    chunk_size_for,
+    edge_semaphore,
+    engine_of,
+    part_suffix,
+    synthesize,
+)
+
 # Безопасный предел для Telegram: Bot API режет загрузку на 50 МБ.
 # edge-tts отдаёт MP3 48 кбит/с (6 КБ/с), русская речь ~850 символов/мин,
 # поэтому 200 000 символов давали ~80 МБ на том и ЛЮБАЯ большая книга падала
@@ -14,23 +23,15 @@ THREADS = 12
 MAX_VOL_CHARS = 75000
 # Сверх этого размера том автоматически пережимается перед отправкой.
 MAX_VOL_BYTES = 45 * 1024 * 1024
-# Размер микро-чанка. edge-tts заметно лучше звучит на коротких фрагментах.
+# Размер микро-чанка для edge-tts (для Silero он свой, см. engines.chunk_size_for).
 TTS_CHUNK_SIZE = 1800
-
-# Сетевые повторы: Microsoft периодически рвёт соединение, а одна ошибка
-# раньше убивала всю книгу целиком вместе с уже готовыми частями.
-MAX_RETRIES = 4
-RETRY_BASE_DELAY = 2.0
 
 SUPPORTED_EXTS = {"pdf", "doc", "docx", "fb2", "epub", "mobi", "txt"}
 
-_global_semaphore: asyncio.Semaphore | None = None
 
 def get_semaphore() -> asyncio.Semaphore:
-    global _global_semaphore
-    if _global_semaphore is None:
-        _global_semaphore = asyncio.Semaphore(THREADS)
-    return _global_semaphore
+    """Очередь тяжёлых задач: у edge-tts своя (сеть), Silero считает сам."""
+    return edge_semaphore()
 
 _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
@@ -116,42 +117,33 @@ async def parse_file(input_path: Path, ext: str) -> str | None:
     return ""
 
 async def validate_voices(codes) -> list[str]:
-    """Проверяет коды голосов против живого списка edge-tts.
+    """Проверяет коды edge-голосов против живого списка edge-tts.
 
-    Возвращает список несуществующих кодов. Если список получить не удалось
-    (нет сети), возвращает пустой список — не мешаем запуску.
+    Коды Silero (префикс "silero:") пропускаем: их список живёт в самой
+    модели, и поднимать её ради проверки на старте бота не хочется.
+    Возвращает список несуществующих кодов. Если список голосов получить не
+    удалось (нет сети), возвращает пустой список — не мешаем запуску.
     """
+    edge_codes = [c for c in codes if engine_of(c) != SILERO]
+    if not edge_codes:
+        return []
     try:
         voices = await edge_tts.list_voices()
     except Exception:
         return []
 
     known = {v.get("ShortName") for v in voices}
-    return sorted(code for code in set(codes) if code not in known)
+    return sorted(code for code in set(edge_codes) if code not in known)
 
 
 async def generate_chunk(text: str, path: Path, voice: str, rate: str):
-    """Озвучивает один чанк с повторами при сетевых сбоях."""
-    async with get_semaphore():
-        last_error: Exception | None = None
+    """Озвучивает один фрагмент выбранным движком.
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                communicate = edge_tts.Communicate(clean_text(text), voice, rate=rate)
-                await communicate.save(str(path))
-                if path.exists() and path.stat().st_size > 0:
-                    return
-                last_error = RuntimeError("edge-tts вернул пустой файл")
-            except Exception as exc:  # noqa: BLE001 - edge_tts бросает разное
-                last_error = exc
-                path.unlink(missing_ok=True)
+    Повторы при сбоях живут внутри движка (engines.synthesize): у edge-tts
+    это обрывы сети, у Silero — сбои загрузки модели.
+    """
+    await synthesize(clean_text(text), voice, rate, path)
 
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-
-        raise RuntimeError(
-            f"edge-tts: не удалось озвучить чанк за {MAX_RETRIES} попыток ({last_error})"
-        ) from last_error
 
 # Границы фраз для нарезки чанков.
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?…:;])\s+")
@@ -240,6 +232,11 @@ async def _squeeze_to_telegram_limit(final_file: Path) -> Path:
 async def process_book(text: str, workdir: Path, voice: str, rate: str, progress_callback, filename: str = "Unknown"):
     """Сборка томов по границам глав с контролем переполнения."""
 
+    # Размер микро-чанка зависит от движка: edge спокойно держит 1800 символов,
+    # Silero падает на всём, что длиннее ~1000.
+    chunk_limit = chunk_size_for(voice)
+    suffix = part_suffix(voice)
+
     # Очистка мусора от pandoc (картинки, html-теги).
     # Раньше здесь стоял re.sub(r'', '', text) с ПУСТЫМ паттерном — он был
     # no-op: комментарий обещал чистку html-тегов, но чистились только картинки.
@@ -295,7 +292,7 @@ async def process_book(text: str, workdir: Path, voice: str, rate: str, progress
     # Чанки считаем заранее и теми же правилами, по которым реально рендерим.
     # Раньше счёт шёл через textwrap.wrap с break_long_words=True, а рендер —
     # с False, поэтому прогресс-бар уезжал за 100% и делился на ноль.
-    volume_chunks = [split_chunks(vol) for vol in volumes_text]
+    volume_chunks = [split_chunks(vol, chunk_limit) for vol in volumes_text]
     volume_chunks = [chunks for chunks in volume_chunks if chunks]
     if not volume_chunks:
         return []
@@ -313,7 +310,7 @@ async def process_book(text: str, workdir: Path, voice: str, rate: str, progress
 
         try:
             for chunk_idx, chunk in enumerate(chunks):
-                part_path = vol_dir / f"part_{chunk_idx:04d}.mp3"
+                part_path = vol_dir / f"part_{chunk_idx:04d}{suffix}"
                 tasks.append(generate_chunk(chunk, part_path, voice, rate))
 
             # Асинхронное ожидание микро-чанков текущего Тома
@@ -329,7 +326,7 @@ async def process_book(text: str, workdir: Path, voice: str, rate: str, progress
             list_file = vol_dir / "list.txt"
             final_file = workdir / f"volume_{vol_idx}.mp3"
 
-            mp3_files = sorted(vol_dir.glob("part_*.mp3"))
+            mp3_files = sorted(vol_dir.glob(f"part_*{suffix}"))
             if not mp3_files:
                 continue
             async with aiofiles.open(list_file, "w", encoding="utf-8") as f:
@@ -340,6 +337,14 @@ async def process_book(text: str, workdir: Path, voice: str, rate: str, progress
             # иначе ffmpeg спотыкается на ID3-теге.
             safe_title = re.sub(r'[\r\n"\'\\]', " ", str(filename))[:80].strip()
 
+            # edge отдаёт готовый mp3 — просто склеиваем поток. Silero отдаёт
+            # wav 24 кГц: кодируем один раз при сборке тома и там же догоняем
+            # выбранную скорость речи фильтром atempo.
+            if suffix == ".wav":
+                codec_args = ["-c:a", "libmp3lame", "-b:a", "48k", *atempo_args(rate)]
+            else:
+                codec_args = ["-c", "copy"]
+
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
@@ -347,7 +352,7 @@ async def process_book(text: str, workdir: Path, voice: str, rate: str, progress
                 "-f", "concat",
                 "-safe", "0",
                 "-i", str(list_file),
-                "-c", "copy",
+                *codec_args,
                 "-metadata", f"title={safe_title} - Часть {vol_idx}",
                 "-metadata", "artist=Phoenix TTS Bot",
                 "-metadata", "album=Аудиокнига",

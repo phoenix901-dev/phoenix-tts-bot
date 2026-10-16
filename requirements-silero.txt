@@ -1,0 +1,11 @@
+# Локальный движок Silero (офлайн-озвучка). Ставится ОТДЕЛЬНО от
+# requirements.txt: torch ставим из cpu-индекса, иначе pip притащит сборку
+# с CUDA на пару гигабайт, которая на сервере без видеокарты бесполезна.
+#
+#   venv/bin/pip install -r requirements-silero.txt
+#
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch
+silero
+soundfile
